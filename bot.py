@@ -274,28 +274,42 @@ async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days, 
     total = 0
 
     for exp in expenses:
-        category = exp['category']
-        amount = exp['amount']
-        description = exp['description']
-        date = exp['date']
+        category = exp["category"]
+        amount = exp["amount"]
+        description = exp["description"]
+        date = exp["date"]
 
-        categories_data.setdefault(category, []).append({
-            'amount': amount,
-            'description': description,
-            'date': date
-        })
+        categories_data.setdefault(category, []).append(
+            {"amount": amount, "description": description, "date": date}
+        )
         total += amount
 
     text = f"📊 Расходы за {period_name}:\n\n"
 
+    # сортируем категории по сумме расходов (убывание)
     sorted_categories = sorted(
-@@ -200,89 +307,124 @@ async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days,
+        categories_data.items(),
+        key=lambda item: sum(x["amount"] for x in item[1]),
+        reverse=True,
+    )
+
+    for category, items in sorted_categories:
+        category_total = sum(x["amount"] for x in items)
+        text += f"📌 {category} — {category_total} ₸\n"
+
+        # показываем до 10 последних трат в категории
+        for exp in items[:10]:
+            exp_date = exp["date"].strftime("%d.%m %H:%M") if exp["date"] else ""
+            text += f"  • {exp['description']} — {exp['amount']} ₸ ({exp_date})\n"
+
+        if len(items) > 10:
+            text += f"  … и ещё {len(items) - 10}\n"
 
         text += "\n"
 
     text += f"💵 ИТОГО: {total} ₸"
-
     await update.message.reply_text(text)
+
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
