@@ -548,13 +548,12 @@ async def categories_list_message(update: Update, context: ContextTypes.DEFAULT_
     await update.effective_message.reply_text(text)
 
 
-async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
+async def clear_data_db(user_id: int) -> int:
     with get_pool().connection() as conn:
         with conn.cursor() as c:
-            c.execute("DELETE FROM expenses WHERE user_id=%s", (update.effective_user.id,))
-            deleted = c.rowcount
-    await update.effective_message.reply_text(f"🗑️ Удалено {deleted} записей.")
+            c.execute("DELETE FROM expenses WHERE user_id=%s", (user_id,))
+            return c.rowcount
+
 
 
 # ---------------- Handlers ----------------
@@ -714,11 +713,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "do:clear":
-        context.user_data.pop("awaiting", None)
-        context.user_data.pop("selected_category", None)
-        await clear_data(update, context)
-        await panel_show(update, context, "🎯 Меню", reply_markup=kb_main())
-        return
+    context.user_data.pop("awaiting", None)
+    context.user_data.pop("selected_category", None)
+
+    deleted = clear_data_db(update.effective_user.id)
+
+    await panel_show(
+        update,
+        context,
+        f"🗑️ Удалено {deleted} записей.",
+        reply_markup=kb_main(),
+    )
+    return
 
     if data == "cat:list":
         await categories_list_message(update, context)
