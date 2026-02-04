@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from datetime import datetime, timedelta
 
 import psycopg
@@ -13,7 +14,7 @@ AMOUNT_PATTERN = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 
 def get_db_connection():
     """Создать подключение к PostgreSQL"""
-    database_url = os.getenv('DATABASE_URL')
+    database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL не установлен!")
     return psycopg.connect(database_url)
@@ -196,7 +197,7 @@ def parse_expense_message(text):
     if amount_index == 1:
         description = category
     else:
-        description = ' '.join(parts[1:amount_index])
+        description = " ".join(parts[1:amount_index])
 
     return category, description, amount
 
@@ -286,7 +287,6 @@ async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days, 
 
     text = f"📊 Расходы за {period_name}:\n\n"
 
-    # сортируем категории по сумме расходов (убывание)
     sorted_categories = sorted(
         categories_data.items(),
         key=lambda item: sum(x["amount"] for x in item[1]),
@@ -297,10 +297,9 @@ async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days, 
         category_total = sum(x["amount"] for x in items)
         text += f"📌 {category} — {category_total} ₸\n"
 
-        # показываем до 10 последних трат в категории
-        for exp in items[:10]:
-            exp_date = exp["date"].strftime("%d.%m %H:%M") if exp["date"] else ""
-            text += f"  • {exp['description']} — {exp['amount']} ₸ ({exp_date})\n"
+        for e in items[:10]:
+            exp_date = e["date"].strftime("%d.%m %H:%M") if e["date"] else ""
+            text += f"  • {e['description']} — {e['amount']} ₸ ({exp_date})\n"
 
         if len(items) > 10:
             text += f"  … и ещё {len(items) - 10}\n"
@@ -309,7 +308,6 @@ async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days, 
 
     text += f"💵 ИТОГО: {total} ₸"
     await update.message.reply_text(text)
-
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -340,7 +338,7 @@ async def categories_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     category_stats = {}
     for exp in expenses:
-        category_stats[exp['category']] = category_stats.get(exp['category'], 0) + exp['amount']
+        category_stats[exp["category"]] = category_stats.get(exp["category"], 0) + exp["amount"]
 
     text = "📂 Твои категории (за месяц):\n\n"
 
@@ -370,7 +368,7 @@ async def add_category_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Укажи название категории.\n\nПример: /addcategory кафе")
         return
 
-    category = ' '.join(context.args).strip().lower()
+    category = " ".join(context.args).strip().lower()
     if not category:
         await update.message.reply_text("❌ Категория не может быть пустой.")
         return
@@ -385,7 +383,7 @@ async def del_category_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Укажи название категории.\n\nПример: /delcategory кафе")
         return
 
-    category = ' '.join(context.args).strip().lower()
+    category = " ".join(context.args).strip().lower()
     if not category:
         await update.message.reply_text("❌ Категория не может быть пустой.")
         return
@@ -404,12 +402,13 @@ def main():
         print(f"❌ Ошибка инициализации БД: {e}")
         return
 
-    token = os.getenv('BOT_TOKEN')
+    token = os.getenv("BOT_TOKEN")
     if not token:
         print("❌ Ошибка: BOT_TOKEN не установлен!")
         return
 
-    application = Application.builder().token(token).build()
+    # Обходим Updater (который падает на Python 3.13) и делаем manual polling
+    application = Application.builder().token(token).updater(None).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("today", today))
@@ -422,9 +421,29 @@ def main():
     application.add_handler(CommandHandler("clear", clear_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_expense))
 
-    print("🤖 Бот запущен и подключен к PostgreSQL!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 Бот запущен (manual polling, без Updater) и подключен к PostgreSQL!")
+
+    async def runner():
+        await application.initialize()
+        await application.start()
+
+        offset = None
+        try:
+            while True:
+                updates = await application.bot.get_updates(
+                    offset=offset,
+                    timeout=30,
+                    allowed_updates=Update.ALL_TYPES,
+                )
+                for upd in updates:
+                    offset = upd.update_id + 1
+                    await application.process_update(upd)
+        finally:
+            await application.stop()
+            await application.shutdown()
+
+    asyncio.run(runner())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
