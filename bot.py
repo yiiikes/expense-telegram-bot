@@ -1,83 +1,208 @@
 import os
+import re
+from datetime import datetime, timedelta
+
 import psycopg
 from psycopg.rows import dict_row
-from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+
+AMOUNT_PATTERN = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 
 
 def get_db_connection():
     """Создать подключение к PostgreSQL"""
     database_url = os.getenv('DATABASE_URL')
     if not database_url:
-        raise Exception("DATABASE_URL не установлен!")
+        raise RuntimeError("DATABASE_URL не установлен!")
     return psycopg.connect(database_url)
+
+
+def ensure_user(user):
+    """Создать пользователя, если он еще не существует."""
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO users (id, username, first_name, last_name)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name
+                """,
+                (user.id, user.username, user.first_name, user.last_name),
+            )
 
 
 def init_db():
     """Инициализация базы данных"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS expenses
-                 (id SERIAL PRIMARY KEY,
-                  user_id BIGINT,
-                  amount REAL,
-                  category TEXT,
-                  description TEXT,
-                  date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS categories (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (user_id, name)
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+                    amount REAL,
+                    category TEXT,
+                    description TEXT,
+                    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date DESC)"
+            )
+            c.execute(
+                """
+                INSERT INTO users (id)
+                SELECT DISTINCT user_id
+                FROM expenses
+                WHERE user_id IS NOT NULL
+                ON CONFLICT DO NOTHING
+                """
+            )
+            c.execute(
+                """
+                INSERT INTO categories (user_id, name)
+                SELECT DISTINCT user_id, category
+                FROM expenses
+                WHERE user_id IS NOT NULL AND category IS NOT NULL
+                ON CONFLICT DO NOTHING
+                """
+            )
     print("✅ База данных инициализирована")
+
+
+def ensure_category(user_id, category):
+    """Создать категорию, если ее еще нет."""
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO categories (user_id, name)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (user_id, category),
+            )
 
 
 def add_expense(user_id, amount, category, description):
     """Добавить расход"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO expenses (user_id, amount, category, description, date) VALUES (%s, %s, %s, %s, %s)",
-        (user_id, amount, category, description, datetime.now())
-    )
-    conn.commit()
-    conn.close()
+    ensure_category(user_id, category)
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO expenses (user_id, amount, category, description, date)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (user_id, amount, category, description, datetime.now()),
+            )
 
 
 def get_expenses(user_id, days=None):
     """Получить расходы за период"""
-    conn = get_db_connection()
-    c = conn.cursor(row_factory=dict_row)
-
-    if days:
-        date_from = datetime.now() - timedelta(days=days)
-        c.execute(
-            "SELECT * FROM expenses WHERE user_id=%s AND date >= %s ORDER BY date DESC",
-            (user_id, date_from)
-        )
-    else:
-        c.execute(
-            "SELECT * FROM expenses WHERE user_id=%s ORDER BY date DESC",
-            (user_id,)
-        )
-
-    expenses = c.fetchall()
-    conn.close()
-    return expenses
+    with get_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as c:
+            if days:
+                date_from = datetime.now() - timedelta(days=days)
+                c.execute(
+                    "SELECT * FROM expenses WHERE user_id=%s AND date >= %s ORDER BY date DESC",
+                    (user_id, date_from),
+                )
+            else:
+                c.execute(
+                    "SELECT * FROM expenses WHERE user_id=%s ORDER BY date DESC",
+                    (user_id,),
+                )
+            return c.fetchall()
 
 
 def get_categories_list(user_id):
     """Получить список всех категорий пользователя"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT DISTINCT category FROM expenses WHERE user_id=%s ORDER BY category",
-        (user_id,)
-    )
-    categories = [row[0] for row in c.fetchall()]
-    conn.close()
-    return categories
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT name FROM categories WHERE user_id=%s ORDER BY name",
+                (user_id,),
+            )
+            categories = [row[0] for row in c.fetchall()]
+            if categories:
+                return categories
+            c.execute(
+                "SELECT DISTINCT category FROM expenses WHERE user_id=%s ORDER BY category",
+                (user_id,),
+            )
+            return [row[0] for row in c.fetchall()]
+
+
+def delete_category(user_id, category):
+    """Удалить категорию из списка пользователя."""
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM categories WHERE user_id=%s AND name=%s",
+                (user_id, category),
+            )
+            return c.rowcount
+
+
+def parse_expense_message(text):
+    """Разобрать сообщение с расходом."""
+    parts = text.split()
+    if len(parts) < 2:
+        return None
+
+    category = parts[0].lower()
+    amount = None
+    amount_index = -1
+
+    for i in range(1, len(parts)):
+        cleaned = parts[i].replace("₸", "").replace(",", ".")
+        if AMOUNT_PATTERN.match(cleaned):
+            amount = float(cleaned)
+            amount_index = i
+            break
+
+    if amount is None:
+        return None
+
+    if amount_index == 1:
+        description = category
+    else:
+        description = ' '.join(parts[1:amount_index])
+
+    return category, description, amount
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
     welcome_text = """
 🎯 Привет! Я помогу тебе вести учет расходов.
 
@@ -100,6 +225,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /month - траты за месяц
 /all - все траты
 /categories - мои категории
+/addcategory - добавить категорию
+/delcategory - удалить категорию
 /clear - очистить все данные
     """
     await update.message.reply_text(welcome_text)
@@ -108,38 +235,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка сообщения с расходом"""
     try:
+        ensure_user(update.effective_user)
         text = update.message.text.strip()
-        parts = text.split()
+        parsed = parse_expense_message(text)
 
-        if len(parts) < 2:
+        if not parsed:
             await update.message.reply_text(
                 "❌ Слишком мало данных!\n\nФормат: <категория> <название> <сумма>\nПример: еда дельпапа 12000"
             )
             return
 
-        category = parts[0].lower()
-
-        amount = None
-        amount_index = -1
-
-        for i in range(1, len(parts)):
-            try:
-                amount = float(parts[i].replace(',', '.'))
-                amount_index = i
-                break
-            except ValueError:
-                continue
-
-        if amount is None:
-            await update.message.reply_text(
-                "❌ Не нашел сумму!\n\nУкажи число в сообщении.\nПример: еда дельпапа 12000"
-            )
-            return
-
-        if amount_index == 1:
-            description = category
-        else:
-            description = ' '.join(parts[1:amount_index])
+        category, description, amount = parsed
 
         add_expense(update.effective_user.id, amount, category, description)
 
@@ -157,6 +263,7 @@ async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days, period_name):
+    ensure_user(update.effective_user)
     expenses = get_expenses(update.effective_user.id, days=days)
 
     if not expenses:
@@ -222,6 +329,7 @@ async def all_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def categories_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
     categories = get_categories_list(update.effective_user.id)
 
     if not categories:
@@ -247,14 +355,46 @@ async def categories_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM expenses WHERE user_id=%s", (update.effective_user.id,))
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
+    ensure_user(update.effective_user)
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM expenses WHERE user_id=%s", (update.effective_user.id,))
+            deleted = c.rowcount
 
     await update.message.reply_text(f"🗑️ Удалено {deleted} записей.\n\nВсе твои данные очищены!")
+
+
+async def add_category_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
+    if not context.args:
+        await update.message.reply_text("❌ Укажи название категории.\n\nПример: /addcategory кафе")
+        return
+
+    category = ' '.join(context.args).strip().lower()
+    if not category:
+        await update.message.reply_text("❌ Категория не может быть пустой.")
+        return
+
+    ensure_category(update.effective_user.id, category)
+    await update.message.reply_text(f"✅ Категория добавлена: {category}")
+
+
+async def del_category_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
+    if not context.args:
+        await update.message.reply_text("❌ Укажи название категории.\n\nПример: /delcategory кафе")
+        return
+
+    category = ' '.join(context.args).strip().lower()
+    if not category:
+        await update.message.reply_text("❌ Категория не может быть пустой.")
+        return
+
+    deleted = delete_category(update.effective_user.id, category)
+    if deleted:
+        await update.message.reply_text(f"🗑️ Категория удалена: {category}")
+    else:
+        await update.message.reply_text(f"⚠️ Категория не найдена: {category}")
 
 
 def main():
@@ -277,6 +417,8 @@ def main():
     application.add_handler(CommandHandler("month", month))
     application.add_handler(CommandHandler("all", all_expenses))
     application.add_handler(CommandHandler("categories", categories_list))
+    application.add_handler(CommandHandler("addcategory", add_category_command))
+    application.add_handler(CommandHandler("delcategory", del_category_command))
     application.add_handler(CommandHandler("clear", clear_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_expense))
 
