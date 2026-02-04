@@ -4,9 +4,8 @@ import csv
 import asyncio
 from io import BytesIO
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Callable, Any
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -23,9 +22,10 @@ from telegram.ext import (
 AMOUNT_PATTERN = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 POOL: ConnectionPool | None = None
 
+
+# ---------------- Pool ----------------
 
 def get_pool() -> ConnectionPool:
     global POOL
@@ -42,7 +42,14 @@ def get_pool() -> ConnectionPool:
     return POOL
 
 
-def init_db():
+async def run_db(fn: Callable[..., Any], *args, **kwargs):
+    """Выполнить синхронную DB-функцию в отдельном потоке, чтобы не блокировать event loop."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+# ---------------- DB (SYNC functions) ----------------
+
+def init_db_sync():
     with get_pool().connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -79,11 +86,9 @@ def init_db():
                 )
                 """
             )
-            c.execute(
-                "CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date DESC)"
-            )
+            c.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date DESC)")
 
-            # миграция со старой структуры (если уже были расходы)
+            # миграция (если уже были расходы)
             c.execute(
                 """
                 INSERT INTO users (id)
@@ -102,10 +107,9 @@ def init_db():
                 ON CONFLICT DO NOTHING
                 """
             )
-    print("✅ База данных инициализирована")
 
 
-def ensure_user(user):
+def ensure_user_sync(user):
     with get_pool().connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -121,7 +125,7 @@ def ensure_user(user):
             )
 
 
-def ensure_category(user_id: int, category: str):
+def ensure_category_sync(user_id: int, category: str):
     category = (category or "").strip().lower()
     if not category:
         return
@@ -137,20 +141,17 @@ def ensure_category(user_id: int, category: str):
             )
 
 
-def delete_category(user_id: int, category: str) -> int:
+def delete_category_sync(user_id: int, category: str) -> int:
     category = (category or "").strip().lower()
     with get_pool().connection() as conn:
         with conn.cursor() as c:
-            c.execute(
-                "DELETE FROM categories WHERE user_id=%s AND name=%s",
-                (user_id, category),
-            )
+            c.execute("DELETE FROM categories WHERE user_id=%s AND name=%s", (user_id, category))
             return c.rowcount
 
 
-def add_expense(user_id: int, amount: float, category: str, description: str):
+def add_expense_sync(user_id: int, amount: float, category: str, description: str):
     category = (category or "").strip().lower()
-    ensure_category(user_id, category)
+    ensure_category_sync(user_id, category)
     with get_pool().connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -162,17 +163,14 @@ def add_expense(user_id: int, amount: float, category: str, description: str):
             )
 
 
-def delete_expense(user_id: int, expense_id: int) -> int:
+def delete_expense_sync(user_id: int, expense_id: int) -> int:
     with get_pool().connection() as conn:
         with conn.cursor() as c:
-            c.execute(
-                "DELETE FROM expenses WHERE id=%s AND user_id=%s",
-                (expense_id, user_id),
-            )
+            c.execute("DELETE FROM expenses WHERE id=%s AND user_id=%s", (expense_id, user_id))
             return c.rowcount
 
 
-def get_expenses(user_id: int, days: Optional[int] = None):
+def get_expenses_sync(user_id: int, days: Optional[int] = None):
     with get_pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as c:
             if days:
@@ -182,14 +180,11 @@ def get_expenses(user_id: int, days: Optional[int] = None):
                     (user_id, date_from),
                 )
             else:
-                c.execute(
-                    "SELECT * FROM expenses WHERE user_id=%s ORDER BY date DESC",
-                    (user_id,),
-                )
+                c.execute("SELECT * FROM expenses WHERE user_id=%s ORDER BY date DESC", (user_id,))
             return c.fetchall()
 
 
-def get_last_expenses(user_id: int, limit: int = 10):
+def get_last_expenses_sync(user_id: int, limit: int = 10):
     with get_pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as c:
             c.execute(
@@ -199,7 +194,7 @@ def get_last_expenses(user_id: int, limit: int = 10):
             return c.fetchall()
 
 
-def get_categories_list(user_id: int):
+def get_categories_list_sync(user_id: int):
     with get_pool().connection() as conn:
         with conn.cursor() as c:
             c.execute("SELECT name FROM categories WHERE user_id=%s ORDER BY name", (user_id,))
@@ -208,6 +203,13 @@ def get_categories_list(user_id: int):
                 return categories
             c.execute("SELECT DISTINCT category FROM expenses WHERE user_id=%s ORDER BY category", (user_id,))
             return [row[0] for row in c.fetchall()]
+
+
+def clear_data_db_sync(user_id: int) -> int:
+    with get_pool().connection() as conn:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM expenses WHERE user_id=%s", (user_id,))
+            return c.rowcount
 
 
 # ---------------- Parsing ----------------
@@ -260,7 +262,7 @@ def parse_amount_only_message(text: str, default_desc: str) -> Optional[Tuple[st
     return desc, amount
 
 
-# ---------------- Panel helpers (anti-spam) ----------------
+# ---------------- Panel (anti-spam) ----------------
 
 PANEL_KEY = "panel_msg_id"
 
@@ -367,8 +369,8 @@ def kb_report_result(period_key: str):
     )
 
 
-def kb_pick_category(user_id: int, context: ContextTypes.DEFAULT_TYPE, page: int = 0, page_size: int = 10):
-    cats = get_categories_list(user_id)
+async def kb_pick_category(user_id: int, context: ContextTypes.DEFAULT_TYPE, page: int = 0, page_size: int = 10):
+    cats = await run_db(get_categories_list_sync, user_id)
     if not cats:
         return InlineKeyboardMarkup(
             [
@@ -378,7 +380,6 @@ def kb_pick_category(user_id: int, context: ContextTypes.DEFAULT_TYPE, page: int
         )
 
     context.user_data["cats_full"] = cats
-
     total = len(cats)
     max_page = max(0, (total - 1) // page_size)
     page = max(0, min(page, max_page))
@@ -433,10 +434,11 @@ def period_to_days(key: str) -> Tuple[Optional[int], str]:
 
 
 async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, period_key: str):
-    ensure_user(update.effective_user)
+    await run_db(ensure_user_sync, update.effective_user)
     user_id = update.effective_user.id
     days, period_name = period_to_days(period_key)
-    expenses = get_expenses(user_id, days=days)
+
+    expenses = await run_db(get_expenses_sync, user_id, days)
 
     if not expenses:
         await update.effective_message.reply_text(f"📭 За {period_name} расходов нет.")
@@ -470,11 +472,11 @@ async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, period
 
 
 async def send_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE, period_key: str):
-    ensure_user(update.effective_user)
+    await run_db(ensure_user_sync, update.effective_user)
     user_id = update.effective_user.id
     days, period_name = period_to_days(period_key)
-    expenses = get_expenses(user_id, days=days)
 
+    expenses = await run_db(get_expenses_sync, user_id, days)
     if not expenses:
         await update.effective_message.reply_text(f"📭 За {period_name} нечего экспортировать.")
         return
@@ -511,9 +513,10 @@ async def render_last_text(expenses: List[dict]) -> str:
 
 
 async def show_last_message(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
-    ensure_user(update.effective_user)
+    await run_db(ensure_user_sync, update.effective_user)
     user_id = update.effective_user.id
-    expenses = get_last_expenses(user_id, limit=10)
+
+    expenses = await run_db(get_last_expenses_sync, user_id, 10)
     text = await render_last_text(expenses)
     markup = kb_last_expenses(expenses) if expenses else InlineKeyboardMarkup(
         [[InlineKeyboardButton("⬅️ В меню", callback_data="m:main")]]
@@ -530,14 +533,15 @@ async def show_last_message(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 async def categories_list_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
+    await run_db(ensure_user_sync, update.effective_user)
     user_id = update.effective_user.id
-    categories = get_categories_list(user_id)
+
+    categories = await run_db(get_categories_list_sync, user_id)
     if not categories:
         await update.effective_message.reply_text("📭 Категорий пока нет.")
         return
 
-    expenses = get_expenses(user_id, days=30)
+    expenses = await run_db(get_expenses_sync, user_id, 30)
     stats = {}
     for exp in expenses:
         stats[exp["category"]] = stats.get(exp["category"], 0) + float(exp["amount"] or 0)
@@ -548,18 +552,10 @@ async def categories_list_message(update: Update, context: ContextTypes.DEFAULT_
     await update.effective_message.reply_text(text)
 
 
-async def clear_data_db(user_id: int) -> int:
-    with get_pool().connection() as conn:
-        with conn.cursor() as c:
-            c.execute("DELETE FROM expenses WHERE user_id=%s", (user_id,))
-            return c.rowcount
-
-
-
 # ---------------- Handlers ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
+    await run_db(ensure_user_sync, update.effective_user)
     context.user_data.pop("awaiting", None)
     context.user_data.pop("selected_category", None)
 
@@ -567,54 +563,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 Меню\n\n"
         "• Добавить трату: кнопкой (категории) или текстом\n"
         "  <категория> <название> <сумма>\n"
-        "  Пример: еда дельпапа 12000"
+        "  Пример: еда дельпапа 12000\n\n"
+        "🧽 Все твои сообщения бот удаляет после обработки."
     )
     await panel_show(update, context, text, reply_markup=kb_main())
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    ВАЖНО: удаляем ВСЕ сообщения пользователя после обработки (успех/ошибка).
-    Чтобы не засорять чат.
-    """
-    ensure_user(update.effective_user)
+    """Удаляем ВСЕ сообщения пользователя после обработки."""
+    await run_db(ensure_user_sync, update.effective_user)
+
     user_msg = update.message
     text = (user_msg.text or "").strip()
-    if not text:
-        # даже пустое — удалим
-        try:
-            await user_msg.delete()
-        except Exception:
-            pass
-        return
 
     try:
+        if not text:
+            return
+
         awaiting = context.user_data.get("awaiting")
 
-        # add category
         if awaiting == "add_category":
             category = text.lower().strip()
             if not category:
                 await panel_show(update, context, "❌ Категория не может быть пустой.", reply_markup=kb_back_cancel("m:categories"))
                 return
-            ensure_category(update.effective_user.id, category)
+            await run_db(ensure_category_sync, update.effective_user.id, category)
             context.user_data.pop("awaiting", None)
             await panel_show(update, context, f"✅ Категория добавлена: {category}", reply_markup=kb_categories_menu())
             return
 
-        # del category
         if awaiting == "del_category":
             category = text.lower().strip()
             if not category:
                 await panel_show(update, context, "❌ Категория не может быть пустой.", reply_markup=kb_back_cancel("m:categories"))
                 return
-            deleted = delete_category(update.effective_user.id, category)
+            deleted = await run_db(delete_category_sync, update.effective_user.id, category)
             context.user_data.pop("awaiting", None)
             msg = f"🗑️ Категория удалена: {category}" if deleted else f"⚠️ Категория не найдена: {category}"
             await panel_show(update, context, msg, reply_markup=kb_categories_menu())
             return
 
-        # expense in chosen category
         if awaiting == "expense_in_category":
             category = context.user_data.get("selected_category")
             if not category:
@@ -633,16 +621,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             description, amount = parsed2
-            add_expense(update.effective_user.id, amount, category, description)
+            await run_db(add_expense_sync, update.effective_user.id, amount, category, description)
 
             context.user_data.pop("awaiting", None)
             context.user_data.pop("selected_category", None)
 
-            # подтверждение в панели (без спама)
             await panel_show(update, context, f"✅ Записано: {category} / {description} — {amount:.0f} ₸", reply_markup=kb_main())
             return
 
-        # raw expense
         parsed = parse_expense_message(text)
         if not parsed:
             await panel_show(
@@ -654,7 +640,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         category, description, amount = parsed
-        add_expense(update.effective_user.id, amount, category, description)
+        await run_db(add_expense_sync, update.effective_user.id, amount, category, description)
         await panel_show(update, context, f"✅ Записано: {category} / {description} — {amount:.0f} ₸", reply_markup=kb_main())
 
     finally:
@@ -668,7 +654,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    ensure_user(update.effective_user)
+
+    await run_db(ensure_user_sync, update.effective_user)
     data = query.data or ""
 
     if data == "noop":
@@ -713,18 +700,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "do:clear":
-    context.user_data.pop("awaiting", None)
-    context.user_data.pop("selected_category", None)
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
 
-    deleted = clear_data_db(update.effective_user.id)
+        deleted = await run_db(clear_data_db_sync, update.effective_user.id)
 
-    await panel_show(
-        update,
-        context,
-        f"🗑️ Удалено {deleted} записей.",
-        reply_markup=kb_main(),
-    )
-    return
+        await panel_show(
+            update,
+            context,
+            f"🗑️ Удалено {deleted} записей.",
+            reply_markup=kb_main(),
+        )
+        return
 
     if data == "cat:list":
         await categories_list_message(update, context)
@@ -746,12 +733,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting", None)
         context.user_data.pop("selected_category", None)
         page = int(data.split(":")[-1])
-        await panel_show(update, context, "Выбери категорию 👇", reply_markup=kb_pick_category(update.effective_user.id, context, page=page))
+        markup = await kb_pick_category(update.effective_user.id, context, page=page)
+        await panel_show(update, context, "Выбери категорию 👇", reply_markup=markup)
         return
 
     if data.startswith("exp:cat:"):
         abs_idx = int(data.split(":")[-1])
-        cats = context.user_data.get("cats_full") or get_categories_list(update.effective_user.id)
+        cats = context.user_data.get("cats_full") or (await run_db(get_categories_list_sync, update.effective_user.id))
+
         if abs_idx < 0 or abs_idx >= len(cats):
             await panel_show(update, context, "⚠️ Категория не найдена. Открой выбор заново.", reply_markup=kb_main())
             return
@@ -768,37 +757,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("r:"):
-        period_key = data.split(":")[-1]
-        await send_report(update, context, period_key)
+        await send_report(update, context, data.split(":")[-1])
         return
 
     if data.startswith("rr:"):
-        period_key = data.split(":")[-1]
-        await send_report(update, context, period_key)
+        await send_report(update, context, data.split(":")[-1])
         return
 
     if data.startswith("x:"):
-        period_key = data.split(":")[-1]
-        await send_export_csv(update, context, period_key)
+        await send_export_csv(update, context, data.split(":")[-1])
         return
 
     if data.startswith("rx:"):
-        period_key = data.split(":")[-1]
-        await send_export_csv(update, context, period_key)
+        await send_export_csv(update, context, data.split(":")[-1])
         return
 
     if data.startswith("e:del:"):
         exp_id = int(data.split(":")[-1])
-        delete_expense(update.effective_user.id, exp_id)
+        await run_db(delete_expense_sync, update.effective_user.id, exp_id)
         await show_last_message(update, context, edit_message=True)
         return
 
 
-# ---------------- Main (manual polling, faster) ----------------
+# ---------------- Manual polling (fast) ----------------
 
 def main():
     try:
-        init_db()
+        init_db_sync()
     except Exception as e:
         print(f"❌ Ошибка инициализации БД: {e}")
         return
@@ -814,7 +799,7 @@ def main():
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("🤖 Бот запущен (pool + faster polling + delete user messages)")
+    print("🤖 Бот запущен (pool + to_thread DB + fast polling + delete user messages)")
 
     async def runner():
         await application.initialize()
@@ -825,7 +810,7 @@ def main():
             while True:
                 updates = await application.bot.get_updates(
                     offset=offset,
-                    timeout=10,  # было 30
+                    timeout=5,  # быстрее реакция
                     allowed_updates=Update.ALL_TYPES,
                 )
                 if not updates:
@@ -834,10 +819,16 @@ def main():
 
                 for upd in updates:
                     offset = upd.update_id + 1
-                    await application.process_update(upd)
+                    try:
+                        await application.process_update(upd)
+                    except Exception as e:
+                        # не падаем из-за одной ошибки
+                        print("❌ Ошибка обработки update:", e)
+
         finally:
             await application.stop()
             await application.shutdown()
+
             global POOL
             try:
                 if POOL:
