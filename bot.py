@@ -1,19 +1,34 @@
 import os
 import re
+import csv
 import asyncio
+from io import BytesIO
 from datetime import datetime, timedelta
+from typing import Optional, Tuple, List
 
 import psycopg
 from psycopg.rows import dict_row
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 
 AMOUNT_PATTERN = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 
 
+# ---------------- DB ----------------
+
 def get_db_connection():
-    """Создать подключение к PostgreSQL"""
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL не установлен!")
@@ -21,7 +36,6 @@ def get_db_connection():
 
 
 def ensure_user(user):
-    """Создать пользователя, если он еще не существует."""
     with get_db_connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -38,7 +52,6 @@ def ensure_user(user):
 
 
 def init_db():
-    """Инициализация базы данных"""
     with get_db_connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -78,6 +91,8 @@ def init_db():
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date DESC)"
             )
+
+            # миграция на всякий случай (если раньше была только expenses)
             c.execute(
                 """
                 INSERT INTO users (id)
@@ -99,8 +114,10 @@ def init_db():
     print("✅ База данных инициализирована")
 
 
-def ensure_category(user_id, category):
-    """Создать категорию, если ее еще нет."""
+def ensure_category(user_id: int, category: str):
+    category = category.strip().lower()
+    if not category:
+        return
     with get_db_connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -113,8 +130,19 @@ def ensure_category(user_id, category):
             )
 
 
-def add_expense(user_id, amount, category, description):
-    """Добавить расход"""
+def delete_category(user_id: int, category: str) -> int:
+    category = category.strip().lower()
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM categories WHERE user_id=%s AND name=%s",
+                (user_id, category),
+            )
+            return c.rowcount
+
+
+def add_expense(user_id: int, amount: float, category: str, description: str):
+    category = category.strip().lower()
     ensure_category(user_id, category)
     with get_db_connection() as conn:
         with conn.cursor() as c:
@@ -127,8 +155,17 @@ def add_expense(user_id, amount, category, description):
             )
 
 
-def get_expenses(user_id, days=None):
-    """Получить расходы за период"""
+def delete_expense(user_id: int, expense_id: int) -> int:
+    with get_db_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM expenses WHERE id=%s AND user_id=%s",
+                (expense_id, user_id),
+            )
+            return c.rowcount
+
+
+def get_expenses(user_id: int, days: Optional[int] = None):
     with get_db_connection() as conn:
         with conn.cursor(row_factory=dict_row) as c:
             if days:
@@ -145,14 +182,20 @@ def get_expenses(user_id, days=None):
             return c.fetchall()
 
 
-def get_categories_list(user_id):
-    """Получить список всех категорий пользователя"""
+def get_last_expenses(user_id: int, limit: int = 10):
+    with get_db_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as c:
+            c.execute(
+                "SELECT * FROM expenses WHERE user_id=%s ORDER BY date DESC LIMIT %s",
+                (user_id, limit),
+            )
+            return c.fetchall()
+
+
+def get_categories_list(user_id: int):
     with get_db_connection() as conn:
         with conn.cursor() as c:
-            c.execute(
-                "SELECT name FROM categories WHERE user_id=%s ORDER BY name",
-                (user_id,),
-            )
+            c.execute("SELECT name FROM categories WHERE user_id=%s ORDER BY name", (user_id,))
             categories = [row[0] for row in c.fetchall()]
             if categories:
                 return categories
@@ -163,19 +206,14 @@ def get_categories_list(user_id):
             return [row[0] for row in c.fetchall()]
 
 
-def delete_category(user_id, category):
-    """Удалить категорию из списка пользователя."""
-    with get_db_connection() as conn:
-        with conn.cursor() as c:
-            c.execute(
-                "DELETE FROM categories WHERE user_id=%s AND name=%s",
-                (user_id, category),
-            )
-            return c.rowcount
+# ---------------- Parsing ----------------
 
-
-def parse_expense_message(text):
-    """Разобрать сообщение с расходом."""
+def parse_expense_message(text: str):
+    """
+    Формат: <категория> <название...> <сумма>
+    Пример: еда дельпапа 12000
+    Пример: такси 2000 -> description="такси"
+    """
     parts = text.split()
     if len(parts) < 2:
         return None
@@ -202,81 +240,205 @@ def parse_expense_message(text):
     return category, description, amount
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    welcome_text = """
-🎯 Привет! Я помогу тебе вести учет расходов.
-
-💡 Формат записи:
-<категория> <название> <сумма>
-
-Примеры:
-• еда дельпапа 12000
-• такси 2000
-• кафе кфс 4500
-• продукты магнум 8000
-• сигареты 1500
-
-Если название не нужно:
-• такси 2000 (запишется как "такси")
-
-📊 Команды:
-/today - траты за сегодня
-/week - траты за неделю
-/month - траты за месяц
-/all - все траты
-/categories - мои категории
-/addcategory - добавить категорию
-/delcategory - удалить категорию
-/clear - очистить все данные
+def parse_amount_only_message(text: str, default_desc: str) -> Optional[Tuple[str, float]]:
     """
-    await update.message.reply_text(welcome_text)
+    Для режима 'категория выбрана кнопкой':
+    ожидаем: <название...> <сумма>  ИЛИ просто <сумма>
+    Возвращает: (description, amount)
+    """
+    parts = text.split()
+    if not parts:
+        return None
+
+    amount = None
+    amount_index = -1
+    for i, p in enumerate(parts):
+        cleaned = p.replace("₸", "").replace(",", ".")
+        if AMOUNT_PATTERN.match(cleaned):
+            amount = float(cleaned)
+            amount_index = i
+            break
+
+    if amount is None:
+        return None
+
+    if amount_index <= 0:
+        desc = default_desc
+    else:
+        desc = " ".join(parts[:amount_index]).strip()
+        if not desc:
+            desc = default_desc
+
+    return desc, amount
 
 
-async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка сообщения с расходом"""
-    try:
-        ensure_user(update.effective_user)
-        text = update.message.text.strip()
-        parsed = parse_expense_message(text)
+# ---------------- Inline Keyboards ----------------
 
-        if not parsed:
-            await update.message.reply_text(
-                "❌ Слишком мало данных!\n\nФормат: <категория> <название> <сумма>\nПример: еда дельпапа 12000"
-            )
-            return
+def kb_main():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ Добавить трату", callback_data="exp:new:0")],
+            [InlineKeyboardButton("📊 Траты (период)", callback_data="m:period")],
+            [InlineKeyboardButton("📈 Отчёт", callback_data="m:report")],
+            [InlineKeyboardButton("🧾 Последние (удалить)", callback_data="m:last")],
+            [InlineKeyboardButton("📤 Экспорт CSV", callback_data="m:export")],
+            [InlineKeyboardButton("📂 Категории", callback_data="m:categories")],
+            [InlineKeyboardButton("🗑 Очистить все", callback_data="do:clear")],
+        ]
+    )
 
-        category, description, amount = parsed
 
-        add_expense(update.effective_user.id, amount, category, description)
+def kb_period():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data="p:today"),
+                InlineKeyboardButton("Неделя", callback_data="p:week"),
+            ],
+            [
+                InlineKeyboardButton("Месяц", callback_data="p:month"),
+                InlineKeyboardButton("Всё время", callback_data="p:all"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+        ]
+    )
 
-        await update.message.reply_text(
-            f"✅ Записано!\n\n"
-            f"📂 Категория: {category}\n"
-            f"📝 Название: {description}\n"
-            f"💰 Сумма: {amount} ₸"
+
+def kb_report():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data="r:today"),
+                InlineKeyboardButton("Неделя", callback_data="r:week"),
+            ],
+            [
+                InlineKeyboardButton("Месяц", callback_data="r:month"),
+                InlineKeyboardButton("Всё время", callback_data="r:all"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+        ]
+    )
+
+
+def kb_export():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сегодня", callback_data="x:today"),
+                InlineKeyboardButton("Неделя", callback_data="x:week"),
+            ],
+            [
+                InlineKeyboardButton("Месяц", callback_data="x:month"),
+                InlineKeyboardButton("Всё время", callback_data="x:all"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+        ]
+    )
+
+
+def kb_categories_menu():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📌 Показать категории", callback_data="cat:list")],
+            [
+                InlineKeyboardButton("➕ Добавить", callback_data="cat:add"),
+                InlineKeyboardButton("➖ Удалить", callback_data="cat:del"),
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+        ]
+    )
+
+
+def kb_back_cancel(back_cb: str):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)],
+            [InlineKeyboardButton("❌ Отмена", callback_data="do:cancel")],
+        ]
+    )
+
+
+def kb_pick_category(user_id: int, context: ContextTypes.DEFAULT_TYPE, page: int = 0, page_size: int = 10):
+    """
+    Пагинация категорий.
+    callback exp:new:<page> - открыть страницу
+    callback exp:cat:<idx>  - выбрать категорию по абсолютному индексу
+    """
+    cats = get_categories_list(user_id)
+    if not cats:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("➕ Создать категорию", callback_data="cat:add")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="m:main")],
+            ]
         )
 
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Ошибка: {str(e)}\n\nФормат: <категория> <название> <сумма>"
-        )
+    # сохраняем список, чтобы по индексу доставать имя
+    context.user_data["cats_full"] = cats
 
+    total = len(cats)
+    max_page = max(0, (total - 1) // page_size)
+    page = max(0, min(page, max_page))
+
+    start = page * page_size
+    end = min(start + page_size, total)
+    slice_cats = list(enumerate(cats[start:end], start=start))  # (absolute_index, name)
+
+    buttons = []
+    row = []
+    for abs_idx, name in slice_cats:
+        row.append(InlineKeyboardButton(name, callback_data=f"exp:cat:{abs_idx}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"exp:new:{page-1}"))
+    nav.append(InlineKeyboardButton(f"Стр {page+1}/{max_page+1}", callback_data="noop"))
+    if page < max_page:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"exp:new:{page+1}"))
+    buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("➕ Новая категория", callback_data="cat:add")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def kb_last_expenses(expenses: List[dict]):
+    # каждая строка: удалить
+    buttons = []
+    for exp in expenses:
+        exp_id = exp["id"]
+        desc = exp["description"] or ""
+        cat = exp["category"] or ""
+        amount = float(exp["amount"] or 0)
+        label = f"🗑 {cat}: {desc} — {amount:.0f} ₸"
+        # callback_data лимит 64, поэтому режем label только в тексте сообщения, а тут только id
+        buttons.append([InlineKeyboardButton(f"🗑 Удалить #{exp_id}", callback_data=f"e:del:{exp_id}")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="m:main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+# ---------------- Views ----------------
 
 async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days, period_name):
     ensure_user(update.effective_user)
     expenses = get_expenses(update.effective_user.id, days=days)
 
     if not expenses:
-        await update.message.reply_text(f"📭 За {period_name} расходов нет.")
+        await update.effective_message.reply_text(f"📭 За {period_name} расходов нет.", reply_markup=kb_main())
         return
 
     categories_data = {}
-    total = 0
+    total = 0.0
 
     for exp in expenses:
         category = exp["category"]
-        amount = exp["amount"]
+        amount = float(exp["amount"] or 0)
         description = exp["description"]
         date = exp["date"]
 
@@ -295,61 +457,128 @@ async def show_period(update: Update, context: ContextTypes.DEFAULT_TYPE, days, 
 
     for category, items in sorted_categories:
         category_total = sum(x["amount"] for x in items)
-        text += f"📌 {category} — {category_total} ₸\n"
+        text += f"📌 {category} — {category_total:.0f} ₸\n"
 
         for e in items[:10]:
             exp_date = e["date"].strftime("%d.%m %H:%M") if e["date"] else ""
-            text += f"  • {e['description']} — {e['amount']} ₸ ({exp_date})\n"
+            text += f"  • {e['description']} — {e['amount']:.0f} ₸ ({exp_date})\n"
 
         if len(items) > 10:
             text += f"  … и ещё {len(items) - 10}\n"
-
         text += "\n"
 
-    text += f"💵 ИТОГО: {total} ₸"
-    await update.message.reply_text(text)
+    text += f"💵 ИТОГО: {total:.0f} ₸"
+
+    await update.effective_message.reply_text(text, reply_markup=kb_period())
 
 
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_period(update, context, 1, "сегодня")
+async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE, days, period_name):
+    ensure_user(update.effective_user)
+    user_id = update.effective_user.id
+    expenses = get_expenses(user_id, days=days)
+
+    if not expenses:
+        await update.effective_message.reply_text(f"📭 За {period_name} расходов нет.", reply_markup=kb_report())
+        return
+
+    total = sum(float(e["amount"] or 0) for e in expenses)
+    by_cat = {}
+    for e in expenses:
+        cat = e["category"] or "без категории"
+        by_cat[cat] = by_cat.get(cat, 0.0) + float(e["amount"] or 0)
+
+    top_cats = sorted(by_cat.items(), key=lambda x: x[1], reverse=True)[:8]
+    top_exp = sorted(expenses, key=lambda x: float(x["amount"] or 0), reverse=True)[:5]
+
+    text = f"📈 Отчёт за {period_name}\n"
+    text += f"💵 Итого: {total:.0f} ₸\n\n"
+
+    text += "🏷 Топ категорий:\n"
+    for cat, amt in top_cats:
+        pct = (amt / total * 100) if total > 0 else 0
+        text += f"• {cat}: {amt:.0f} ₸ ({pct:.1f}%)\n"
+
+    text += "\n💎 Топ трат:\n"
+    for e in top_exp:
+        amt = float(e["amount"] or 0)
+        cat = e["category"] or "—"
+        desc = e["description"] or ""
+        dt = e["date"].strftime("%d.%m %H:%M") if e["date"] else ""
+        text += f"• {amt:.0f} ₸ — {cat} / {desc} ({dt})\n"
+
+    await update.effective_message.reply_text(text, reply_markup=kb_report())
 
 
-async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_period(update, context, 7, "неделю")
+async def send_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE, days, period_key: str):
+    ensure_user(update.effective_user)
+    user_id = update.effective_user.id
+    expenses = get_expenses(user_id, days=days)
+
+    if not expenses:
+        await update.effective_message.reply_text("📭 Нечего экспортировать.", reply_markup=kb_export())
+        return
+
+    output = BytesIO()
+    output.write("date,category,description,amount\n".encode("utf-8"))
+
+    writer = csv.writer(output)
+    for e in reversed(expenses):  # в файле пусть будет от старых к новым
+        dt = e["date"].strftime("%Y-%m-%d %H:%M:%S") if e["date"] else ""
+        writer.writerow([dt, e["category"], e["description"], float(e["amount"] or 0)])
+
+    output.seek(0)
+    filename = f"expenses_{period_key}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+
+    await update.effective_message.reply_document(
+        document=InputFile(output, filename=filename),
+        caption="📤 Экспорт расходов (CSV)",
+        reply_markup=kb_export(),
+    )
 
 
-async def month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_period(update, context, 30, "месяц")
+async def show_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user)
+    user_id = update.effective_user.id
+    expenses = get_last_expenses(user_id, limit=10)
 
+    if not expenses:
+        await update.effective_message.reply_text("📭 Трат пока нет.", reply_markup=kb_main())
+        return
 
-async def all_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_period(update, context, None, "всё время")
+    text = "🧾 Последние 10 трат:\n\n"
+    for e in expenses:
+        exp_id = e["id"]
+        amt = float(e["amount"] or 0)
+        cat = e["category"] or "—"
+        desc = e["description"] or ""
+        dt = e["date"].strftime("%d.%m %H:%M") if e["date"] else ""
+        text += f"#{exp_id} • {cat} / {desc} — {amt:.0f} ₸ ({dt})\n"
+
+    await update.effective_message.reply_text(text, reply_markup=kb_last_expenses(expenses))
 
 
 async def categories_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
-    categories = get_categories_list(update.effective_user.id)
+    user_id = update.effective_user.id
+    categories = get_categories_list(user_id)
 
     if not categories:
-        await update.message.reply_text("📭 У тебя пока нет категорий.\n\nНачни добавлять расходы!")
+        await update.effective_message.reply_text(
+            "📭 У тебя пока нет категорий.\n\nНажми «➕ Добавить» и создай первую.",
+            reply_markup=kb_categories_menu(),
+        )
         return
 
-    expenses = get_expenses(update.effective_user.id, days=30)
-
-    category_stats = {}
+    expenses = get_expenses(user_id, days=30)
+    stats = {}
     for exp in expenses:
-        category_stats[exp["category"]] = category_stats.get(exp["category"], 0) + exp["amount"]
+        stats[exp["category"]] = stats.get(exp["category"], 0) + float(exp["amount"] or 0)
 
-    text = "📂 Твои категории (за месяц):\n\n"
-
-    for category, total in sorted(category_stats.items(), key=lambda x: x[1], reverse=True):
-        text += f"• {category}: {total} ₸\n"
-
+    text = "📂 Категории (за 30 дней):\n\n"
     for cat in categories:
-        if cat not in category_stats:
-            text += f"• {cat}: 0 ₸\n"
+        text += f"• {cat}: {stats.get(cat, 0):.0f} ₸\n"
 
-    await update.message.reply_text(text)
+    await update.effective_message.reply_text(text, reply_markup=kb_categories_menu())
 
 
 async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,41 +588,274 @@ async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("DELETE FROM expenses WHERE user_id=%s", (update.effective_user.id,))
             deleted = c.rowcount
 
-    await update.message.reply_text(f"🗑️ Удалено {deleted} записей.\n\nВсе твои данные очищены!")
+    await update.effective_message.reply_text(f"🗑️ Удалено {deleted} записей.", reply_markup=kb_main())
 
 
-async def add_category_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- Handlers ----------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
-    if not context.args:
-        await update.message.reply_text("❌ Укажи название категории.\n\nПример: /addcategory кафе")
-        return
+    context.user_data.pop("awaiting", None)
+    context.user_data.pop("selected_category", None)
 
-    category = " ".join(context.args).strip().lower()
-    if not category:
-        await update.message.reply_text("❌ Категория не может быть пустой.")
-        return
+    text = (
+        "🎯 Привет! Я бот для учета расходов.\n\n"
+        "✅ Можно записывать трату текстом:\n"
+        "<категория> <название> <сумма>\n"
+        "Пример: еда дельпапа 12000\n\n"
+        "Или нажми «➕ Добавить трату» и выбери категорию кнопкой 👇"
+    )
+    await update.effective_message.reply_text(text, reply_markup=kb_main())
 
-    ensure_category(update.effective_user.id, category)
-    await update.message.reply_text(f"✅ Категория добавлена: {category}")
 
-
-async def del_category_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Любой текст:
+    - если ждём категорию (add/del) -> обработаем
+    - если ждём сумму/описание по выбранной категории -> добавим расход
+    - иначе -> пытаемся парсить как обычный расход: <категория> <название> <сумма>
+    """
     ensure_user(update.effective_user)
-    if not context.args:
-        await update.message.reply_text("❌ Укажи название категории.\n\nПример: /delcategory кафе")
+    text = (update.message.text or "").strip()
+    if not text:
         return
 
-    category = " ".join(context.args).strip().lower()
-    if not category:
-        await update.message.reply_text("❌ Категория не может быть пустой.")
+    awaiting = context.user_data.get("awaiting")
+
+    # --- добавление категории ---
+    if awaiting == "add_category":
+        category = text.lower().strip()
+        if not category:
+            await update.effective_message.reply_text(
+                "❌ Категория не может быть пустой.",
+                reply_markup=kb_back_cancel("m:categories"),
+            )
+            return
+        ensure_category(update.effective_user.id, category)
+        context.user_data.pop("awaiting", None)
+        await update.effective_message.reply_text(f"✅ Категория добавлена: {category}", reply_markup=kb_categories_menu())
         return
 
-    deleted = delete_category(update.effective_user.id, category)
-    if deleted:
-        await update.message.reply_text(f"🗑️ Категория удалена: {category}")
-    else:
-        await update.message.reply_text(f"⚠️ Категория не найдена: {category}")
+    # --- удаление категории ---
+    if awaiting == "del_category":
+        category = text.lower().strip()
+        if not category:
+            await update.effective_message.reply_text(
+                "❌ Категория не может быть пустой.",
+                reply_markup=kb_back_cancel("m:categories"),
+            )
+            return
+        deleted = delete_category(update.effective_user.id, category)
+        context.user_data.pop("awaiting", None)
+        if deleted:
+            await update.effective_message.reply_text(f"🗑️ Категория удалена: {category}", reply_markup=kb_categories_menu())
+        else:
+            await update.effective_message.reply_text(f"⚠️ Категория не найдена: {category}", reply_markup=kb_categories_menu())
+        return
 
+    # --- расход по выбранной категории кнопкой ---
+    if awaiting == "expense_in_category":
+        category = context.user_data.get("selected_category")
+        if not category:
+            context.user_data.pop("awaiting", None)
+            await update.effective_message.reply_text("⚠️ Категория не выбрана. Открой меню заново.", reply_markup=kb_main())
+            return
+
+        parsed2 = parse_amount_only_message(text, default_desc=category)
+        if not parsed2:
+            await update.effective_message.reply_text(
+                "❌ Не нашёл сумму.\n\nПиши так:\n<название> <сумма>\nПример: дельпапа 12000\n\nИли просто сумму: 2000",
+                reply_markup=kb_back_cancel("exp:new:0"),
+            )
+            return
+
+        description, amount = parsed2
+        add_expense(update.effective_user.id, amount, category, description)
+
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+
+        await update.effective_message.reply_text(
+            f"✅ Записано!\n\n📂 Категория: {category}\n📝 Название: {description}\n💰 Сумма: {amount:.0f} ₸",
+            reply_markup=kb_main(),
+        )
+        return
+
+    # --- обычный режим: category name amount ---
+    parsed = parse_expense_message(text)
+    if not parsed:
+        await update.effective_message.reply_text(
+            "❌ Не понял формат.\n\n"
+            "1) Через кнопки: «➕ Добавить трату»\n"
+            "2) Или текстом:\n<категория> <название> <сумма>\nПример: еда дельпапа 12000",
+            reply_markup=kb_main(),
+        )
+        return
+
+    category, description, amount = parsed
+    add_expense(update.effective_user.id, amount, category, description)
+
+    await update.effective_message.reply_text(
+        f"✅ Записано!\n\n📂 Категория: {category}\n📝 Название: {description}\n💰 Сумма: {amount:.0f} ₸",
+        reply_markup=kb_main(),
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ensure_user(update.effective_user)
+    data = query.data or ""
+
+    # noop for pager label
+    if data == "noop":
+        return
+
+    # --- global cancel ---
+    if data == "do:cancel":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text("Ок, отменил 👌", reply_markup=kb_main())
+        return
+
+    # --- меню ---
+    if data == "m:main":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text("Главное меню 👇", reply_markup=kb_main())
+        return
+
+    if data == "m:period":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text("Выбери период 👇", reply_markup=kb_period())
+        return
+
+    if data == "m:report":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text("Выбери период для отчёта 👇", reply_markup=kb_report())
+        return
+
+    if data == "m:export":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text("Выбери период для экспорта 👇", reply_markup=kb_export())
+        return
+
+    if data == "m:last":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        return await show_last(update, context)
+
+    if data == "m:categories":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text("Меню категорий 👇", reply_markup=kb_categories_menu())
+        return
+
+    # --- добавить трату (пагинация категорий) ---
+    if data.startswith("exp:new:"):
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        page = int(data.split(":")[-1])
+        await update.effective_message.reply_text(
+            "Выбери категорию 👇",
+            reply_markup=kb_pick_category(update.effective_user.id, context, page=page),
+        )
+        return
+
+    if data.startswith("exp:cat:"):
+        abs_idx = int(data.split(":")[-1])
+        cats = context.user_data.get("cats_full") or get_categories_list(update.effective_user.id)
+        if abs_idx < 0 or abs_idx >= len(cats):
+            await update.effective_message.reply_text("⚠️ Категория не найдена. Открой выбор заново.", reply_markup=kb_main())
+            return
+
+        category = cats[abs_idx]
+        context.user_data["selected_category"] = category
+        context.user_data["awaiting"] = "expense_in_category"
+
+        await update.effective_message.reply_text(
+            f"📌 Категория выбрана: {category}\n\n"
+            "Теперь напиши:\n<название> <сумма>\n"
+            "Пример: дельпапа 12000\n\n"
+            "Или просто сумму: 2000",
+            reply_markup=kb_back_cancel("exp:new:0"),
+        )
+        return
+
+    # --- периоды (обычный список) ---
+    if data == "p:today":
+        return await show_period(update, context, 1, "сегодня")
+    if data == "p:week":
+        return await show_period(update, context, 7, "неделю")
+    if data == "p:month":
+        return await show_period(update, context, 30, "месяц")
+    if data == "p:all":
+        return await show_period(update, context, None, "всё время")
+
+    # --- отчёт ---
+    if data == "r:today":
+        return await show_report(update, context, 1, "сегодня")
+    if data == "r:week":
+        return await show_report(update, context, 7, "неделю")
+    if data == "r:month":
+        return await show_report(update, context, 30, "месяц")
+    if data == "r:all":
+        return await show_report(update, context, None, "всё время")
+
+    # --- экспорт ---
+    if data == "x:today":
+        return await send_export_csv(update, context, 1, "today")
+    if data == "x:week":
+        return await send_export_csv(update, context, 7, "week")
+    if data == "x:month":
+        return await send_export_csv(update, context, 30, "month")
+    if data == "x:all":
+        return await send_export_csv(update, context, None, "all")
+
+    # --- категории ---
+    if data == "cat:list":
+        return await categories_list(update, context)
+
+    if data == "cat:add":
+        context.user_data["awaiting"] = "add_category"
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text(
+            "Напиши название категории (например: кафе)",
+            reply_markup=kb_back_cancel("m:categories"),
+        )
+        return
+
+    if data == "cat:del":
+        context.user_data["awaiting"] = "del_category"
+        context.user_data.pop("selected_category", None)
+        await update.effective_message.reply_text(
+            "Напиши категорию, которую удалить (например: кафе)",
+            reply_markup=kb_back_cancel("m:categories"),
+        )
+        return
+
+    # --- удаление трат ---
+    if data.startswith("e:del:"):
+        exp_id = int(data.split(":")[-1])
+        deleted = delete_expense(update.effective_user.id, exp_id)
+        if deleted:
+            await update.effective_message.reply_text(f"🗑️ Удалено: #{exp_id}", reply_markup=kb_main())
+        else:
+            await update.effective_message.reply_text(f"⚠️ Не нашёл трату #{exp_id}", reply_markup=kb_main())
+        return
+
+    # --- очистка ---
+    if data == "do:clear":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("selected_category", None)
+        return await clear_data(update, context)
+
+
+# ---------------- Main (manual polling) ----------------
 
 def main():
     try:
@@ -407,21 +869,14 @@ def main():
         print("❌ Ошибка: BOT_TOKEN не установлен!")
         return
 
-    # Обходим Updater (который падает на Python 3.13) и делаем manual polling
+    # manual polling (без Updater) — чтобы не падало на Python 3.13
     application = Application.builder().token(token).updater(None).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("today", today))
-    application.add_handler(CommandHandler("week", week))
-    application.add_handler(CommandHandler("month", month))
-    application.add_handler(CommandHandler("all", all_expenses))
-    application.add_handler(CommandHandler("categories", categories_list))
-    application.add_handler(CommandHandler("addcategory", add_category_command))
-    application.add_handler(CommandHandler("delcategory", del_category_command))
-    application.add_handler(CommandHandler("clear", clear_data))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_expense))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("🤖 Бот запущен (manual polling, без Updater) и подключен к PostgreSQL!")
+    print("🤖 Бот запущен (удаление/экспорт/пагинация/отчёт + manual polling)")
 
     async def runner():
         await application.initialize()
